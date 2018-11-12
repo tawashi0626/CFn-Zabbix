@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  HostName:
+    Description: Instance Tag Name
+    Default: zabbix
+    Type: String
+
+  VpcId:
+    Description: "VpcId of your existing Virtual Private Cloud (VPC)"
+    Type: AWS::EC2::VPC::Id
+    ConstraintDescription: "must be the VPC Id of an existing Virtual Private Cloud."
+
+  Ec2Subnets:
+    Description: "The list of SubnetIds in your Virtual Private Cloud (VPC)"
+    Type: List<AWS::EC2::Subnet::Id>
+    ConstraintDescription: "must be a list of at least two existing subnets associated with at least two different availability zones. They should be residing in the selected Virtual Private Cloud."
+
+  KeyName:
+    Description: "Name of an existing EC2 KeyPair to enable SSH access to the instances"
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: "must be the name of an existing EC2 KeyPair."
+
+  InstanceType:
+    Description: "Zabbix Instance Type"
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+    - t2.nano
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+    - t3.nano
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - m4.large
+    - m4.xlarge
+    - m4.2xlarge
+    - m4.4xlarge
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    - m5.4xlarge
+    ConstraintDescription: "must be a valid EC2 instance type."
+
+  VolSize:
+    Type: Number
+    Default: 30
+    MinValue: 30
+    MaxValue: 16384
+    ConstraintDescription: 'xxGiB 〜 xxxxxGiB'
+
+  SSHLocation:
+    Description: "The IP address range that can be used to SSH to the EC2 instances"
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: "0.0.0.0/0"
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: "must be a valid IP CIDR range of the form x.x.x.x/x."
+
+  MariaDBZabbixPassword:
+    NoEcho: true
+    Description: "The WordPress kusanagi account password"
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: "must contain only alphanumeric characters."
+
+  Amzn2LatestAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    AllowedValues:
+    - /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  ZabbixSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Enable HTTP access via port 80 locked down to the load balancer"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: "0.0.0.0/0"
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref SSHLocation
+      VpcId: !Ref VpcId
+
+  Ec2Zabbix:
+    DependsOn: Ec2ZabbixEip
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref Amzn2LatestAMI
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      BlockDeviceMappings:
+      - DeviceName: /dev/xvda
+        Ebs:
+          VolumeSize: !Ref VolSize
+          VolumeType: gp2
+          DeleteOnTermination: 'true'
+      SubnetId:
+        !Select
+        - 0
+        - !Ref Ec2Subnets
+      SecurityGroupIds:
+      - !Ref ZabbixSg
+      Tags:
+      - Key: Name
+        Value: !Ref HostName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum -y update
+          rpm -i https://repo.zabbix.com/zabbix/4.0/rhel/7/x86_64/zabbix-release-4.0-1.el7.noarch.rpm
+          yum -y install zabbix-server-mysql zabbix-web-mysql zabbix-agent zabbix-web-japanese zabbix-get
+          yum -y install mariadb-server mariadb
+          cp /etc/my.cnf.d/server.cnf /etc/my.cnf.d/server.cnf_bk
+          cat << EOS > /etc/my.cnf.d/server.cnf
+          [server]
+
+          [mysqld]
+          character-set-server = utf8
+          collation-server = utf8_bin
+          skip-character-set-client-handshake
+          innodb_file_per_table
+
+          [embedded]
+
+          [mysqld-5.5]
+
+          [mariadb]
+
+          [mariadb-5.5]
+          EOS
+          systemctl start mariadb
+          systemctl enable mariadb
+          mysql -uroot << EOS
+          create database zabbix character set utf8 collate utf8_bin;
+          grant all privileges on zabbix.* to zabbix@localhost identified by '${MariaDBZabbixPassword}';
+          EOS
+          zcat /usr/share/doc/zabbix-server-mysql*/create.sql.gz | mysql -uzabbix --password=${MariaDBZabbixPassword} zabbix
+
+          sed -i 's/# DBPassword=/DBPassword=password/g' /etc/zabbix/zabbix_server.conf
+          sed -i '/date.timezone/c \        php_value date.timezone Asia\/Tokyo' /etc/httpd/conf.d/zabbix.conf
+          systemctl restart zabbix-server zabbix-agent httpd
+          systemctl enable zabbix-server zabbix-agent httpd
+
+  Ec2ZabbixEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  Ec2ZabbixEipAssociation:
+    DependsOn: Ec2ZabbixEip
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt Ec2ZabbixEip.AllocationId
+      InstanceId: !Ref Ec2Zabbix
+
+Outputs:
+  WebsiteURL:
+    Value:
+      !Join
+      - ""
+      - - "http://"
+        - !GetAtt
+          - Ec2Zabbix
+          - PublicIp
+        - "/zabbix"
+    Description: "Zabbix Website"
