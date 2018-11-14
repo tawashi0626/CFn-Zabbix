@@ -64,7 +64,7 @@ Parameters:
 
   MariaDBZabbixPassword:
     NoEcho: true
-    Description: "The WordPress kusanagi account password"
+    Description: "The DB zabbix account password"
     Type: String
     MinLength: 1
     MaxLength: 64
